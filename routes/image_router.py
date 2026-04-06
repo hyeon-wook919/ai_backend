@@ -1,11 +1,12 @@
 # 사진 찰캌 후 -> 우산 판별 및 유해물품 검사
 
 from fastapi import APIRouter, File, UploadFile
-import io
+import io 
 from PIL import Image
 
 # core 폴더에 미리 올려둔 ViT 모델을 가져온다
 from core.ai_models import vit_classifier 
+from schemas.image_schema import ImageAnalyzeResponse
 
 router = APIRouter()
 
