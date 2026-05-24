@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 from pydantic import BaseModel, Field
 from typing import List, Optional
 
@@ -40,12 +40,9 @@ class ChatResponse(BaseModel):
     ai_confidence:        str                # 검색 방식 (예: "RAG 시맨틱 매칭 성공")
     ai_response:          str                # Gemini가 생성한 공감형 답변
     recommended_policies: List[PolicyItem]   # 추천 정책 카드 리스트
-=======
+
 from pydantic import BaseModel
 from typing import List
-
-from schemas.recommend_schema import PolicyItem
-
 
 # -------------------------------------------------------------------
 # 챗봇 API의 요청/응답 양식
@@ -74,4 +71,4 @@ class ChatResponse(BaseModel):
 class ChatUnclearResponse(BaseModel):
     ai_response: str        # "어떤 도움이 필요하신지 더 자세히 말씀해 주세요." 같은 안내 문구
     recommended_policies: list  # 빈 리스트 []
->>>>>>> c54ff4be60edae1ccc9c817c1eb3e3182d869de3
+
