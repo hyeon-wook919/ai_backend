@@ -4,6 +4,7 @@ import logging
 from typing import List
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool # 🔥 비동기 논블로킹 처리를 위한 모듈 추가
 from PIL import Image
 
 from core.ai_models import get_vit_classifier
@@ -12,10 +13,8 @@ from schemas.image_schema import ImageAnalyzeResponse, ImageBatchSafetyResponse
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-
 # -------------------------------------------------------------------
-# 유해물품 키워드 목록
-# 단어 경계(\b) 정규식으로 매칭 → "stomach"에 "match"가 걸리는 오탐 방지
+# 환경 설정
 # -------------------------------------------------------------------
 DANGEROUS_KEYWORDS = [
     "knife", "cleaver", "lighter", "weapon",
@@ -26,14 +25,13 @@ DANGEROUS_KEYWORDS = [
 ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_FILES = 5
 CONFIDENCE_THRESHOLD = 0.30
+MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 🔥 파일 용량 제한 (장당 5MB)
 
 
 def is_dangerous_label(label: str) -> bool:
     """
     AI가 예측한 레이블에 유해물품 키워드가 포함되어 있는지 확인합니다.
     단어 경계(\b)를 사용해 정확한 단어 단위로만 매칭합니다.
-    예) "stomach" → "match" 키워드에 걸리지 않음 ✅
-    예) "cleaver"  → "cleaver" 키워드에 정확히 걸림 ✅
     """
     for keyword in DANGEROUS_KEYWORDS:
         if re.search(rf'\b{re.escape(keyword)}\b', label):
@@ -43,18 +41,6 @@ def is_dangerous_label(label: str) -> bool:
 
 # -------------------------------------------------------------------
 # [Step 1] 다중 이미지 일괄 안전 검사 API (Fail-Fast)
-#
-# 설계 의도:
-# - 동일 물품의 다양한 각도 사진을 1~5장 올립니다.
-# - 단 1장이라도 유해물품으로 판독되면 즉시 루프를 멈추고
-#   {"is_safe": false}를 반환 → Step 2(글쓰기)로 진행 차단.
-# - 모든 사진이 안전할 때만 {"is_safe": true}를 반환합니다.
-#
-# [Swagger UI 파일 선택창 정상화]
-# Annotated[List[UploadFile], File()] 방식은 이 FastAPI 버전에서
-# Swagger가 array<string>으로 잘못 렌더링합니다.
-# files1~files5를 각각 Optional로 받아서 합치는 방식으로 해결합니다.
-# 프론트엔드 실제 연동 시에는 files[] 키로 여러 장 한번에 보내면 됩니다.
 # -------------------------------------------------------------------
 @router.post("/check-safety", response_model=ImageBatchSafetyResponse)
 async def check_images_safety(
@@ -64,14 +50,6 @@ async def check_images_safety(
     file4: UploadFile = File(None, description="물품 사진 4장 (선택)"),
     file5: UploadFile = File(None, description="물품 사진 5장 (선택)"),
 ):
-    """
-    기부 물품 사진 1~5장을 받아 유해물품 여부를 일괄 검사합니다. (Fail-Fast)
-
-    - 단 1장이라도 유해물품 감지 시 → 즉시 중단, is_safe=false 반환
-    - 모든 사진 통과 시 → is_safe=true 반환 (Step 2 진행 가능)
-    """
-
-    # None이 아닌 파일만 리스트로 모읍니다
     files: List[UploadFile] = [
         f for f in [file1, file2, file3, file4, file5] if f is not None
     ]
@@ -79,29 +57,37 @@ async def check_images_safety(
     if not files:
         raise HTTPException(status_code=400, detail="사진을 최소 1장 이상 올려주세요.")
 
-    # 모델 로딩 (최초 1회만 실제 로딩, 이후 캐시 반환)
     try:
         classifier = get_vit_classifier()
     except RuntimeError as e:
         logger.error(f"ViT 모델 호출 실패: {e}")
         raise HTTPException(status_code=503, detail=str(e))
 
-    # ------------------------------------------------------------------
-    # Fail-Fast 루프: 사진 한 장씩 검사
-    # ------------------------------------------------------------------
     for idx, file in enumerate(files, start=1):
-
-        # 파일 형식 검증
+        # 1. 파일 형식 검증
         if file.content_type not in ALLOWED_CONTENT_TYPES:
             raise HTTPException(
                 status_code=400,
                 detail=f"{idx}번째 파일({file.filename}): 지원하지 않는 형식입니다. JPG, PNG, WEBP만 가능합니다."
             )
 
-        # 이미지 읽기
+        # 2. 파일 용량 및 빈 파일 검증 (🔥 서버 다운 방어)
         try:
             image_bytes = await file.read()
+            if not image_bytes:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"{idx}번째 파일({file.filename}): 비어있는 파일입니다."
+                )
+            if len(image_bytes) > MAX_FILE_SIZE_BYTES:
+                raise HTTPException(
+                    status_code=413, 
+                    detail=f"{idx}번째 파일({file.filename}): 용량이 너무 큽니다. (최대 5MB)"
+                )
+            
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except HTTPException:
+            raise  # 위에서 발생한 HTTP 에러는 그대로 던짐
         except Exception as e:
             logger.warning(f"이미지 파일 읽기 실패: {file.filename} - {e}")
             raise HTTPException(
@@ -109,9 +95,10 @@ async def check_images_safety(
                 detail=f"{idx}번째 파일({file.filename}): 손상된 파일입니다. 다시 올려주세요."
             )
 
-        # AI 예측
+        # 3. AI 예측 (🔥 비동기 래핑으로 서버 블로킹 방지)
         try:
-            ai_result = classifier(image)
+            # run_in_threadpool을 사용하여 메인 루프를 막지 않음
+            ai_result = await run_in_threadpool(classifier, image)
         except Exception as e:
             logger.error(f"이미지 분류 중 예외 발생 ({file.filename}): {e}")
             raise HTTPException(status_code=500, detail="이미지 분석 중 오류가 발생했습니다.")
@@ -122,27 +109,19 @@ async def check_images_safety(
 
         logger.info(f"[{idx}/{len(files)}] {file.filename} → {top_prediction} ({confidence_percent}%)")
 
-        # 확신도가 너무 낮으면 해당 장만 통과 (판별 불가 = 위험하다고 단정 못 함)
         if confidence < CONFIDENCE_THRESHOLD:
             logger.info(f"낮은 확신도, 판별 불가 통과 처리: {file.filename}")
             continue
 
-        # ★ 핵심: 유해물품 감지 즉시 루프 탈출 후 차단 응답 반환
         if is_dangerous_label(top_prediction):
-            logger.warning(
-                f"유해물품 감지! [{idx}번째] {file.filename} → {top_prediction} ({confidence_percent}%)"
-            )
+            logger.warning(f"유해물품 감지! [{idx}번째] {file.filename} -> {top_prediction} ({confidence_percent}%)")
             return ImageBatchSafetyResponse(
-                is_safe=False,
-                message=(
-                    f"⛔ {idx}번째 사진에서 기부 불가 물품이 감지되었습니다. "
-                    f"해당 물품은 기부할 수 없습니다. (감지 항목: {top_prediction})"
-                ),
-                dangerous_file=file.filename,
-                dangerous_label=top_prediction,
-            )
+            is_safe=False,
+            message=f"⛔ {idx}번째 사진에서 기부 불가 물품(위험물, 흉기류 등)이 감지되어 등록할 수 없습니다.",
+            dangerous_file=file.filename,
+            dangerous_label=top_prediction, 
+    )
 
-    # 전체 통과
     logger.info(f"전체 {len(files)}장 안전 확인 완료.")
     return ImageBatchSafetyResponse(
         is_safe=True,
@@ -154,12 +133,9 @@ async def check_images_safety(
 
 # -------------------------------------------------------------------
 # [단일 판별] 이미지 1장 빠른 체크 API
-# AI 글쓰기 없이 단순 유해물 여부만 빠르게 확인할 때 사용합니다.
 # -------------------------------------------------------------------
 @router.post("", response_model=ImageAnalyzeResponse)
 async def predict_image(file: UploadFile = File(...)):
-    """이미지 1장을 받아 유해물품 여부를 판별합니다."""
-
     if file.content_type not in ALLOWED_CONTENT_TYPES:
         raise HTTPException(
             status_code=400,
@@ -168,14 +144,22 @@ async def predict_image(file: UploadFile = File(...)):
 
     try:
         image_bytes = await file.read()
+        if not image_bytes:
+            raise HTTPException(status_code=400, detail="비어있는 파일입니다.")
+        if len(image_bytes) > MAX_FILE_SIZE_BYTES:
+            raise HTTPException(status_code=413, detail="용량이 너무 큽니다. (최대 5MB)")
+            
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.warning(f"이미지 파일 읽기 실패: {file.filename} - {e}")
         raise HTTPException(status_code=400, detail="이미지 파일을 읽을 수 없습니다.")
 
     try:
         classifier = get_vit_classifier()
-        ai_result = classifier(image)
+        # 🔥 비동기 래핑 적용
+        ai_result = await run_in_threadpool(classifier, image)
     except RuntimeError as e:
         logger.error(f"ViT 모델 호출 실패: {e}")
         raise HTTPException(status_code=503, detail=str(e))

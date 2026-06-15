@@ -4,6 +4,7 @@ import faiss
 import os
 
 from fastapi import APIRouter, HTTPException
+from fastapi.concurrency import run_in_threadpool  # 🔥 비동기 처리를 위한 모듈 추가
 from sentence_transformers import SentenceTransformer
 from google.genai import types, Client
 from dotenv import load_dotenv
@@ -23,7 +24,6 @@ load_dotenv()
 # 2. DB 연결
 # -------------------------------------------------------------------
 DB_URL = os.getenv("DB_URL")
-
 
 try:
     db_engine = create_engine(DB_URL, connect_args={"ssl": {}})
@@ -54,20 +54,10 @@ except Exception as e:
 
 # -------------------------------------------------------------------
 # 5. DB에서 정책 로드 + FAISS 인덱스 구축
-#
-# [컬럼 구조]
-# policy_id        : PK
-# policy_name      : 정책명
-# category         : 카테고리 (생활비/주거/의료/교육/양육/일자리/복지)
-# agency           : 기관
-# summary          : 요약 - 카드 목록에 짧게 표시
-# target_criteria  : 지원 대상 - 자세히 보기 화면
-# support_detail   : 지원 내용 - 자세히 보기 화면
-# content          : 자세히 보기 본문 (= ai_search_text와 동일 내용)
-# ai_search_text   : FAISS 검색용 줄글 (사용자에게 노출 안 됨)
 # -------------------------------------------------------------------
 POLICIES_CACHE = []
 faiss_index = None
+MAX_MESSAGE_LENGTH = 500  # 🔥 유저 채팅 글자 수 제한 (서버 및 API 요금 보호용)
 
 
 def build_faiss_index():
@@ -99,10 +89,10 @@ def build_faiss_index():
                 "category":        row[2],
                 "agency":          row[3],
                 "summary":         " ".join(row[4].split()),
-                "target_criteria": row[5],   # 지원 대상
-                "support_detail":  row[6],   # 지원 내용
-                "content":         row[7],   # 자세히 보기 본문
-                "ai_search_text":  row[8],   # FAISS 검색용
+                "target_criteria": row[5],
+                "support_detail":  row[6],
+                "content":         row[7],
+                "ai_search_text":  row[8],
             }
             for row in rows
         ]
@@ -129,20 +119,21 @@ build_faiss_index()
 
 # -------------------------------------------------------------------
 # 6. 챗봇 엔드포인트
-#
-# 흐름:
-# [유저 질문]
-#   → FAISS 시맨틱 매칭으로 관련 정책 2개 추출
-#   → SEARCH_HISTORY DB에 검색 기록 저장
-#   → Gemini가 정책 내용 기반으로 따뜻한 말투로 답변 생성
-#   → AI 답변 + 추천 정책 카드 반환
 # -------------------------------------------------------------------
 @router.post("/", response_model=ChatResponse)
 async def process_chat(request: ChatRequest):
     message = request.user_message
 
+    # 🔥 예외 처리 1: 빈 메시지 및 텍스트 폭탄(DOS 공격) 방어
     if not message or not message.strip():
         raise HTTPException(status_code=400, detail="메시지를 입력해 주세요.")
+    
+    if len(message) > MAX_MESSAGE_LENGTH:
+        logger.warning(f"텍스트 폭탄 감지: {len(message)}자 입력됨")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"질문이 너무 깁니다. {MAX_MESSAGE_LENGTH}자 이내로 요약해 주세요."
+        )
 
     if not embedder or faiss_index is None:
         raise HTTPException(status_code=503, detail="AI 엔진이 준비되지 않았습니다.")
@@ -151,10 +142,16 @@ async def process_chat(request: ChatRequest):
         raise HTTPException(status_code=503, detail="정책 데이터가 로드되지 않았습니다.")
 
     # ------------------------------------------------------------------
-    # Step 1: FAISS 시맨틱 매칭 (상위 2개 정책 추출)
+    # Step 1: FAISS 시맨틱 매칭
     # ------------------------------------------------------------------
-    user_vector = embedder.encode([message])
-    distances, indices = faiss_index.search(np.array(user_vector).astype("float32"), 2)
+    try:
+        # 🔥 예외 처리 2: CPU를 많이 먹는 임베딩 연산을 스레드풀로 넘겨서 서버 마비 방지
+        user_vector = await run_in_threadpool(embedder.encode, [message])
+        # FAISS 검색은 C++ 기반으로 매우 빠르므로 직접 호출해도 무방합니다.
+        distances, indices = faiss_index.search(np.array(user_vector).astype("float32"), 2)
+    except Exception as e:
+        logger.error(f"임베딩 벡터 변환 또는 FAISS 검색 실패: {e}")
+        raise HTTPException(status_code=500, detail="AI 검색 중 오류가 발생했습니다.")
 
     matched_policies = []
     policy_texts_for_gemini = []
@@ -163,8 +160,12 @@ async def process_chat(request: ChatRequest):
         if idx != -1 and idx < len(POLICIES_CACHE):
             policy = POLICIES_CACHE[idx]
             matched_policies.append(policy)
+            # 🔥 AI가 기관, 대상, 내용을 명확히 인지하도록 구조화해서 전달
             policy_texts_for_gemini.append(
-                f"- 정책명: {policy['policy_name']}\n  상세내용: {policy['ai_search_text']}"
+                f"- 정책명: {policy['policy_name']}\n"
+                f"  담당기관: {policy['agency']}\n"
+                f"  지원대상: {policy['target_criteria']}\n"
+                f"  지원내용: {policy['support_detail']}"
             )
 
     if not matched_policies:
@@ -180,8 +181,6 @@ async def process_chat(request: ChatRequest):
 
     # ------------------------------------------------------------------
     # Step 2: SEARCH_HISTORY DB 저장
-    # member_id: 요청에서 받은 값 사용, 없으면 임시 1번
-    # DB 저장 실패해도 챗봇 응답은 정상 반환
     # ------------------------------------------------------------------
     member_id = request.member_id or 1
 
@@ -203,27 +202,32 @@ async def process_chat(request: ChatRequest):
                 )
             logger.info(f"🚀 검색 기록 저장 완료! member_id={member_id}, policy_id={matched_policies[0]['policy_id']}")
     except Exception as e:
-        logger.error(f"❌ DB 저장 실패: {e}")
+        logger.error(f"❌ DB 저장 실패 (챗봇 응답은 계속 진행됩니다): {e}")
 
     # ------------------------------------------------------------------
-    # Step 3: Gemini 답변 생성
+    # Step 3: Gemini 답변 생성 (🔥 프롬프트 방어막 추가)
     # ------------------------------------------------------------------
     policies_str = "\n\n".join(policy_texts_for_gemini)
     system_prompt = f"""
-너는 취약계층 나눔/기부 플랫폼의 따뜻하고 다정한 복지 전담 상담사 '나눔이'야.
-유저가 경제적 어려움이나 고충을 털어놓으면 첫 문장에 반드시 진심 어린 위로와 공감을 건네줘.
+너는 취약계층 나눔/기부 플랫폼의 따뜻하고 다정한 인간적인 복지 상담사 '나눔이'야.
+AI나 봇처럼 기계적인 말투(예: "안내해 드리겠습니다", "도움이 되셨으면 좋겠습니다")를 피하고, 실제 사람이 대화하듯 자연스럽고 친절하게 말해줘.
 
 [DB에서 엄선해온 실제 지원 정책 정보]
 {policies_str}
 
-[답변 원칙]
-1. 위 [실제 지원 정책 정보]에 기반해서만 답변할 것. 없는 정책을 지어내지 말 것.
-2. 어르신이나 소외계층도 읽기 편하게 친절하고 부드러운 격식체(~습니다, ~해요)를 쓸 것.
-3. 정책의 핵심(혜택 및 대상)을 강조하되 3~4문장 내외로 간결하게 요약할 것.
+[🔥 핵심 답변 원칙]
+1. 악성 입력 차단: 유저의 입력이 의미 없는 자음/모음 반복(예: ㅇㅇㅇ, ㅋㅋㅋ), 장난, 욕설이거나 복지와 무관한 내용이면 위 [DB 정보]를 쓰지 마. 대신 "어떤 도움이 필요하신지 조금 더 자세히 말씀해 주시겠어요?"라고 정중하게 안내만 해.
+2. 정책 추천 방식 (가장 중요): 정책을 추천할 때는 임의로 "주민센터에 문의하세요" 같은 말을 지어내지 마.
+   반드시 위 [DB 정보]에 있는 <담당기관>, <지원대상>, <지원내용>을 활용해서 구체적이고 정확하게 적어.
+   (예시: "이 정책은 [보건복지부]에서 [만 65세 이상 어르신]을 대상으로 [매월 연금을 지급]해 드리는 제도예요.")
+3. 일반 복지 상식: 유저가 '중위소득 기준', '기초생활수급자 뜻' 등 일반적인 복지 용어를 물어볼 때는, 너의 자체 지식을 활용해서 알기 쉽게 설명해 줘.
+4. 어르신 맞춤 말투: 어르신도 읽기 편하게 전체 답변을 3~4문장 내외로 간결하게 쓰고, 부드러운 격식체(~해요, ~습니다)를 사용해.
+5. 절대 금지: 답변에 굵게 처리 기호(**)나 별표(*) 같은 마크다운 특수기호를 절대, 단 한 개도 사용하지 마. 오직 순수한 일반 텍스트로만 출력해.
 """
 
     try:
-        response = gemini_client.models.generate_content(
+        response = await run_in_threadpool(
+            gemini_client.models.generate_content,
             model="gemini-2.5-flash",
             contents=f"사용자 고충: {message}",
             config=types.GenerateContentConfig(
@@ -231,9 +235,25 @@ async def process_chat(request: ChatRequest):
             )
         )
         ai_answer = response.text
+        
     except Exception as e:
-        logger.error(f"Gemini API 통신 실패: {e}")
-        raise HTTPException(status_code=500, detail="AI 응답 생성 중 오류가 발생했습니다.")
+        error_msg = str(e)
+        logger.error(f"Gemini API 통신 실패: {error_msg}")
+        
+        # 🔥 예외 처리: 구글 무료 API 한도 초과(429) 감지
+        if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
+            raise HTTPException(
+                status_code=429, 
+                detail="현재 접속자가 많아 AI 응답이 지연되고 있습니다. 잠시 후(약 20초) 다시 시도해 주세요."
+            )
+        # 🔥 예외 처리: Gemini 자체 안전 필터(Safety)에 폭언이 걸렸을 경우
+        elif "SAFETY" in error_msg.upper():
+            raise HTTPException(
+                status_code=400, 
+                detail="부적절한 단어가 포함되어 답변을 생성할 수 없습니다."
+            )
+        else:
+            raise HTTPException(status_code=500, detail="AI 응답 생성 중 오류가 발생했습니다.")
 
     # ------------------------------------------------------------------
     # Step 4: 최종 응답 반환
